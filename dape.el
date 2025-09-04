@@ -1150,7 +1150,7 @@ as is."
               (tramp-file-name-user parts)
               (tramp-file-name-host parts)
               "")))
-        (dape--message "Remote connection detected, setting prefix-local to %S"
+        (dape--message "Remote connection detected, setting `prefix-local' to %S"
                        prefix-local)
         (plist-put config 'prefix-local prefix-local)))
     (when (and (plist-get config 'command)
@@ -1158,7 +1158,7 @@ as is."
                (not (plist-get config 'host))
                (equal (tramp-file-name-method parts) "ssh"))
       (let ((host (file-remote-p default-directory 'host)))
-        (dape--message "Remote connection detected, setting host to %S" host)
+        (dape--message "Remote connection detected, setting `host' to %S" host)
         (plist-put config 'host host))))
   config)
 
@@ -2035,20 +2035,24 @@ BODY is an plist of adapter capabilities."
 Update `dape--breakpoints' according to BODY."
   (when-let* ((update (plist-get body :breakpoint))
               (id (plist-get update :id)))
-    ;; Until `:reason' gets properly speced, try to infer update
-    ;; intention, would prefer `pcase' on `:reason'.
-    (if-let* ((breakpoint
-               (cl-find id dape--breakpoints
-                        :key (lambda (breakpoint)
-                               (plist-get (dape--breakpoint-id breakpoint) conn)))))
-        (dape--breakpoint-update conn breakpoint update)
-      (unless (equal (plist-get body :reason) "removed")
+    (let ((breakpoint
+           (cl-find id dape--breakpoints
+                    :key (lambda (breakpoint)
+                           (plist-get (dape--breakpoint-id breakpoint) conn)))))
+      (cond
+       (breakpoint
+        (dape--breakpoint-update conn breakpoint update))
+       ((not (equal (plist-get body :reason) "removed"))
         (dape--with-request (dape--source-ensure conn update)
           (when-let* ((marker (dape--object-to-marker conn update)))
             (dape--with-line (marker-buffer marker) (plist-get update :line)
-              (dape--message "Creating breakpoint in %s:%d"
-                             (buffer-name) (plist-get update :line))
-              (dape--breakpoint-place))))))))
+              (if-let* ((breakpoints (dape--breakpoints-at-point)))
+                  (dape-breakpoint-remove-at-point 'skip-update)
+                (dape--message "Creating breakpoint in %s:%d"
+                               (buffer-name) (plist-get update :line)))
+              (dape--breakpoint-update
+               conn (dape--breakpoint-place nil nil 'skip-update)
+               update)))))))))
 
 (cl-defmethod dape-handle-event (conn (_event (eql module)) body)
   "Handle adapter CONNs module events.
@@ -3189,22 +3193,20 @@ If FROM-RESTART is non nil keep id and verified."
            else do
            (dape--breakpoint-remove breakpoint)))
 
-(defun dape--breakpoint-place (&optional type value)
+(defun dape--breakpoint-place (&optional type value skip-update)
   "Place breakpoint at current line.
-Valid values for TYPE is nil, `log', `expression' and `hits'.
-If TYPE is non nil VALUE is expected to be an string.
-If there are breakpoints at current line remove those breakpoints from
-`dape--breakpoints'.  Updates all breakpoints in all known connections."
+TYPE is expected to be nil, `log', `expression', `hits', or `until'.
+If TYPE is `log', `expression', or `hits', VALUE should be a string.
+Unless SKIP-UPDATE is non-nil, push changes to all connections.
+Note: removes existing breakpoints at the line before placing."
   (unless (derived-mode-p 'prog-mode)
     (user-error "Trying to set breakpoint in none `prog-mode' buffer"))
-  ;; Remove breakpoints at line
   (dape-breakpoint-remove-at-point 'skip-update)
-  ;; Create breakpoint
   (let ((breakpoint (dape--breakpoint-make :type type :value value)))
     (dape--breakpoint-set-overlay breakpoint)
     (push breakpoint dape--breakpoints)
-    ;; ...and push to adapter
-    (dape--breakpoint-broadcast-update (current-buffer))
+    (unless skip-update
+      (dape--breakpoint-broadcast-update (current-buffer)))
     breakpoint))
 
 (defun dape--breakpoint-delete-overlay (breakpoint)
@@ -3359,10 +3361,10 @@ See `dape-request' for expected CB signature."
          (refrence (plist-get source :sourceReference))
          (buffer (plist-get dape--source-buffers refrence)))
     (cond
-     ((or (and (stringp path) (file-exists-p (dape--path-local conn path)) path)
+     ((or (and (stringp path) (file-exists-p (dape--path-local conn path)))
           (and (buffer-live-p buffer) buffer))
       (dape--request-continue cb))
-     ((and (numberp refrence) (< 0 refrence) refrence)
+     ((and (numberp refrence) (< 0 refrence))
       (dape--with-request-bind
           ((&key content mimeType &allow-other-keys) error)
           (dape-request conn :source
@@ -5091,10 +5093,9 @@ CONN is inferred for interactive invocations."
                           (eq (dape--breakpoint-type breakpoint) 'until))
                do (dape--breakpoint-disable breakpoint 'until)
                finally do (dape--breakpoints-update))
-      (when-let* ((breakpoint (dape--breakpoint-place 'until)))
-        ;; Bookkeeping - store until breakpoint
-        (when (dape--stopped-threads conn)
-          (dape-continue conn))))))
+      (dape--breakpoint-place 'until)
+      (when (dape--stopped-threads conn)
+        (dape-continue conn)))))
 
 (defun dape--until-reset ()
   "Reset run until point state."
@@ -5458,26 +5459,27 @@ Completes from suggested conjurations, a configuration is suggested if
 it's for current `major-mode' and it's available.
 See `modes' and `ensure' in `dape-configs'."
   (let* ((suggested-configs
-          (cl-loop for (key . config) in dape-configs
+          (cl-loop for (name . config) in dape-configs
                    when (and (dape--config-mode-p config)
                              (dape--config-ensure config))
-                   collect (dape--config-to-string key nil)))
+                   collect (symbol-name name)))
          (initial-contents
           (or
            ;; Take `dape-command' if exist
            (when dape-command
              (dape--config-to-string (car dape-command) (cdr dape-command)))
            ;; Take first valid history item
-           (seq-find (lambda (str)
-                       (ignore-errors
-                         (thread-first (dape--config-from-string str)
-                                       (car)
-                                       (dape--config-to-string nil)
-                                       (member suggested-configs))))
-                     dape-history)
+           (cl-loop for string in dape-history
+                    for (_ config) = (ignore-errors
+                                       (dape--config-from-string string))
+                    when (and config
+                              (dape--config-mode-p config)
+                              (dape--config-ensure config))
+                    return string)
            ;; Take first suggested config if only one exist
-           (and (length= suggested-configs 1)
-                (car suggested-configs))))
+           (when (and (length= suggested-configs 1)
+                      (car suggested-configs))
+             suggested-configs)))
          (default-value
           (when initial-contents
             (pcase-let ((`(,key ,config)
